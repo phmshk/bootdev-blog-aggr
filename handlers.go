@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/phmshk/bootdev-blog-aggr/internal/api"
 	"github.com/phmshk/bootdev-blog-aggr/internal/database"
 )
 
@@ -35,12 +35,13 @@ func handlerRegister(s *state, cmd command) error {
 	}
 
 	name := cmd.Args[0]
-	createdUser, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-		Name:      name,
-	},
+	createdUser, err := s.db.CreateUser(
+		context.Background(), database.CreateUserParams{
+			ID:        uuid.New(),
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+			Name:      name,
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("an arror occured while creating a user, %v", err)
@@ -101,28 +102,31 @@ func printAllUsers(users []database.User, currUser string) {
 }
 
 func handlerAgg(s *state, cmd command) error {
-	if len(cmd.Args) > 0 {
-		return fmt.Errorf("no arguments should be provided for this command, %s", cmd.Name)
+	if len(cmd.Args) != 1 {
+		return fmt.Errorf("usage: %s <time>", cmd.Name)
 	}
 
-	feed, err := api.FetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+	timeBetweenReqs, err := time.ParseDuration(cmd.Args[0])
 	if err != nil {
-		return fmt.Errorf("an error occurred: %v", err)
+		return err
 	}
 
-	fmt.Printf("%+v\n", feed)
+	fmt.Printf("Collecting feeds every %s...\n", timeBetweenReqs)
 
-	return nil
+	ticker := time.NewTicker(timeBetweenReqs)
+
+	for ; ; <-ticker.C {
+		err := scrapeFeeds(s)
+		if err != nil {
+			fmt.Printf("Scraping error: %v\n", err)
+			continue
+		}
+	}
 }
 
-func handlerAddFeed(s *state, cmd command) error {
+func handlerAddFeed(s *state, cmd command, user database.User) error {
 	if len(cmd.Args) != 2 {
 		return fmt.Errorf("usage: %s <name> <url>", cmd.Name)
-	}
-	currUserName := s.cfg.CurrentUserName
-	currUser, err := s.db.GetUser(context.Background(), currUserName)
-	if err != nil {
-		return fmt.Errorf("error fetching user: %v", err)
 	}
 
 	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
@@ -131,16 +135,27 @@ func handlerAddFeed(s *state, cmd command) error {
 		UpdatedAt: time.Now(),
 		Name:      cmd.Args[0],
 		Url:       cmd.Args[1],
-		UserID:    currUser.ID,
+		UserID:    user.ID,
 	})
 	if err != nil {
 		return fmt.Errorf("error creating feed: %v", err)
 	}
 
+	_, err = s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("error following feed: %v", err)
+	}
 	fmt.Println("Feed created successfully:")
 	printFeed(feed)
 	fmt.Println()
 	fmt.Println("=====================================")
+
 	return nil
 }
 
@@ -173,6 +188,118 @@ func handlerFeeds(s *state, cmd command) error {
 		fmt.Printf("* URL:         %s\n", feed.Url)
 		fmt.Printf("* Created by:  %s\n", feed.UserName)
 		fmt.Println("--------------------")
+	}
+
+	return nil
+}
+
+func handlerFollow(s *state, cmd command, user database.User) error {
+	if len(cmd.Args) != 1 {
+		return fmt.Errorf("usage: %s <url>", cmd.Name)
+	}
+
+	url := cmd.Args[0]
+	feed, err := s.db.GetFeedByUrl(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("an error occurred: %v", err)
+	}
+
+	createdFeedFollow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("an error occurred: %v", err)
+	}
+
+	fmt.Println("Feed Followed Successfully:")
+	fmt.Printf("Name: %s\n", createdFeedFollow.FeedName)
+	fmt.Printf("CurrentUserName: %s\n", user.Name)
+	fmt.Println("==============================================")
+
+	return nil
+}
+
+func handlerFollowing(s *state, cmd command, user database.User) error {
+	if len(cmd.Args) > 0 {
+		return fmt.Errorf("no arguments should be provided for this command, %s", cmd.Name)
+	}
+
+	feeds, err := s.db.GetFeedFollowsForUser(context.Background(), user.ID)
+	if err != nil {
+		return fmt.Errorf("an error occurred: %v", err)
+	}
+
+	if len(feeds) == 0 {
+		fmt.Printf("%s is not following any feeds\n", user.Name)
+		return nil
+	}
+
+	fmt.Printf("%s is following all the feeds listed below:\n", user.Name)
+	for i, feed := range feeds {
+		fmt.Printf("%d. %s\n", i+1, feed.FeedName)
+	}
+
+	return nil
+}
+
+func handlerUnfollow(s *state, cmd command, user database.User) error {
+	if len(cmd.Args) != 1 {
+		return fmt.Errorf("usage: %s <url>", cmd.Name)
+	}
+	feedUrl := cmd.Args[0]
+	feed, err := s.db.GetFeedByUrl(context.Background(), feedUrl)
+	if err != nil {
+		return fmt.Errorf("error fetching feed: %v", err)
+	}
+
+	err = s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("error unfollowing feed %s: %v", feedUrl, err)
+	}
+
+	fmt.Println("Feed successfully unfollowed!")
+	return nil
+}
+
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.Args) > 0 {
+		if i, err := strconv.Atoi(cmd.Args[0]); err == nil {
+			limit = i
+		} else {
+			return fmt.Errorf("invalid limit: %s", cmd.Args[0])
+		}
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("error getting posts from db: %v", err)
+	}
+	fmt.Printf("Showing %d posts for user %s:\n", len(posts), user.Name)
+
+	for _, post := range posts {
+		pubDate := "Unknown date"
+		if post.PublishedAt.Valid {
+			pubDate = post.PublishedAt.Time.Format("2006-01-02 15:04")
+		}
+
+		fmt.Printf("--- %s ---\n", post.Title)
+		fmt.Printf("PubDate: %s\n", pubDate)
+		fmt.Printf("Link:   %s\n", post.Url)
+		if post.Description.Valid {
+			fmt.Printf("Desc:   %s\n", post.Description.String)
+		}
+		fmt.Println()
 	}
 
 	return nil
